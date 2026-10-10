@@ -1,0 +1,322 @@
+"""
+LLM Advisor Module — Uses Claude API to provide intelligent, explainable
+cleaning recommendations based on actual data analysis.
+
+This is what makes the tool genuinely AI-powered:
+- Explains WHY something is wrong (not just that it is)
+- Recommends the BEST cleaning strategy per column
+- Generates human-readable quality reports
+- Provides confidence-aware suggestions
+"""
+
+import os
+import json
+import pandas as pd
+import numpy as np
+import streamlit as st
+import anthropic
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Initialize Anthropic client (uses ANTHROPIC_API_KEY env var automatically)
+_client = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic()
+    return _client
+
+
+def _safe_sample(series: pd.Series, n: int = 8) -> list:
+    """Get a representative sample including nulls and edge values."""
+    non_null = series.dropna()
+    samples = []
+    if len(non_null) > 0:
+        samples = non_null.sample(min(n, len(non_null)), random_state=42).tolist()
+        # Convert numpy types to native Python for JSON serialization
+        samples = [x.item() if hasattr(x, "item") else x for x in samples]
+    return samples
+
+
+def _build_column_profile(df: pd.DataFrame, column: str) -> dict:
+    """Build a rich statistical profile of a column for the LLM."""
+    col = df[column]
+    profile = {
+        "name": column,
+        "dtype": str(col.dtype),
+        "total_rows": len(col),
+        "missing_count": int(col.isnull().sum()),
+        "missing_pct": round(col.isnull().mean() * 100, 2),
+        "unique_count": int(col.nunique()),
+        "sample_values": _safe_sample(col),
+    }
+
+    if pd.api.types.is_numeric_dtype(col):
+        desc = col.describe()
+        profile.update({
+            "mean": round(float(desc["mean"]), 4) if not pd.isna(desc["mean"]) else None,
+            "std": round(float(desc["std"]), 4) if not pd.isna(desc["std"]) else None,
+            "min": float(desc["min"]) if not pd.isna(desc["min"]) else None,
+            "max": float(desc["max"]) if not pd.isna(desc["max"]) else None,
+            "q25": float(desc["25%"]) if not pd.isna(desc["25%"]) else None,
+            "q75": float(desc["75%"]) if not pd.isna(desc["75%"]) else None,
+            # IQR-based outlier count
+            "iqr_outlier_count": int(
+                ((col < (desc["25%"] - 1.5 * (desc["75%"] - desc["25%"]))) |
+                 (col > (desc["75%"] + 1.5 * (desc["75%"] - desc["25%"])))).sum()
+            ) if not pd.isna(desc["25%"]) else 0,
+        })
+    else:
+        vc = col.value_counts()
+        profile.update({
+            "top_values": vc.head(5).to_dict(),
+            "has_mixed_case": bool(
+                col.dropna().astype(str).str.lower().nunique() <
+                col.dropna().astype(str).nunique()
+            ),
+        })
+
+    return profile
+
+
+# ─────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────
+
+def suggest_cleaning_strategy(df: pd.DataFrame, column: str) -> dict:
+    """
+    Ask Claude to recommend the best cleaning strategy for a column.
+
+    Returns a dict with keys:
+        strategy       – recommended approach (e.g. 'knn_impute', 'mode_impute', 'drop')
+        confidence     – 'high' | 'medium' | 'low'
+        reasoning      – plain-English explanation
+        warnings       – list of concerns
+        params         – suggested parameters (e.g. {"n_neighbors": 5})
+    """
+    profile = _build_column_profile(df, column)
+    prompt = f"""You are a data quality expert. Analyze this column profile and recommend the best cleaning strategy.
+
+Column Profile:
+{json.dumps(profile, indent=2)}
+
+Respond ONLY with valid JSON matching this exact schema (no markdown fences):
+{{
+  "strategy": "<one of: knn_impute | mode_impute | median_impute | mean_impute | forward_fill | drop_column | flag_only | semantic_impute>",
+  "confidence": "<high | medium | low>",
+  "reasoning": "<2-3 sentence plain English explanation of why this strategy fits>",
+  "warnings": ["<specific concern 1>", "<specific concern 2>"],
+  "params": {{}}
+}}
+
+Rules:
+- knn_impute: best for numeric columns with spatial/relational patterns
+- semantic_impute: best for categorical columns where values relate to other columns
+- mode_impute: for low-cardinality categoricals with clear dominant value
+- drop_column: only if missing > 70% and column has no predictive value
+- If numeric outliers are high (>5%), note that in warnings
+- params may include n_neighbors (int), weight_missing (bool), etc."""
+
+    try:
+        client = _get_client()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text.strip()
+        return json.loads(raw)
+    except Exception as e:
+        logger.error(f"LLM strategy suggestion failed: {e}")
+        return {
+            "strategy": "mode_impute",
+            "confidence": "low",
+            "reasoning": "LLM unavailable — defaulting to mode imputation.",
+            "warnings": [str(e)],
+            "params": {}
+        }
+
+
+def explain_anomalies(df: pd.DataFrame, column: str, anomaly_indices: list) -> str:
+    """
+    Ask Claude to explain detected anomalies in plain English.
+
+    Args:
+        df: Full dataframe
+        column: Column where anomalies were detected
+        anomaly_indices: Row indices flagged as anomalies
+
+    Returns:
+        Plain-English explanation string
+    """
+    if not anomaly_indices:
+        return "No anomalies detected."
+
+    col = df[column]
+    normal_sample = _safe_sample(col.drop(index=anomaly_indices, errors="ignore"), n=5)
+    anomaly_sample = _safe_sample(col.iloc[anomaly_indices] if anomaly_indices else col, n=5)
+
+    prompt = f"""You are a data quality analyst. Explain these anomalies to a non-technical user.
+
+Column: "{column}"
+Normal value examples: {normal_sample}
+Anomalous value examples: {anomaly_sample}
+Total anomalies: {len(anomaly_indices)} out of {len(col)} rows ({round(len(anomaly_indices)/len(col)*100,1)}%)
+
+Write 2-3 sentences explaining:
+1. What pattern the anomalies break
+2. What might have caused them (data entry error, unit mismatch, outlier events, etc.)
+3. Whether they should be removed or investigated
+
+Be specific about the values. Do not say "as shown above". Write for a data analyst audience."""
+
+    try:
+        client = _get_client()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=256,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"LLM anomaly explanation failed: {e}")
+        return f"Anomaly explanation unavailable: {e}"
+
+
+def generate_quality_report(df: pd.DataFrame, issues: dict) -> str:
+    """
+    Generate a full natural-language data quality report.
+
+    Args:
+        df: The dataframe being analyzed
+        issues: Output from detect_errors_and_issues()
+
+    Returns:
+        Markdown-formatted report string
+    """
+    summary = {
+        "rows": len(df),
+        "columns": len(df.columns),
+        "missing_columns": list(issues.get("missing_values", {}).keys()),
+        "total_missing": sum(
+            v["count"] for v in issues.get("missing_values", {}).values()
+        ),
+        "duplicate_rows": issues.get("duplicates", {}).get("exact", 0),
+        "outlier_columns": list(issues.get("outliers", {}).keys()),
+        "format_issue_columns": list(issues.get("format_issues", {}).keys()),
+        "column_names": df.columns.tolist()[:20],  # cap for token budget
+    }
+
+    prompt = f"""You are a senior data scientist writing a data quality report for a business stakeholder.
+
+Dataset summary:
+{json.dumps(summary, indent=2)}
+
+Write a concise Markdown report with these sections:
+## Overall Assessment
+(1 sentence grade: Excellent / Good / Fair / Poor, and why)
+
+## Key Issues Found
+(bullet list, most critical first, with specific numbers)
+
+## Recommended Cleaning Priority
+(numbered list of actions, most impactful first)
+
+## Risk Flags
+(anything that could cause problems downstream if uncleaned)
+
+Be specific. Use the actual column names and numbers. Maximum 300 words."""
+
+    try:
+        client = _get_client()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"LLM quality report failed: {e}")
+        return f"**Report generation failed:** {e}\n\nFalling back to raw statistics."
+
+
+def smart_rename_suggestion(df: pd.DataFrame, column: str) -> dict:
+    """
+    Suggest a standardized, descriptive column name based on its content.
+
+    Returns dict with 'suggested_name' and 'reasoning'.
+    """
+    sample = _safe_sample(df[column], n=10)
+    prompt = f"""Suggest a clean, standardized column name for this data column.
+
+Current name: "{column}"
+Data type: {str(df[column].dtype)}
+Sample values: {sample}
+
+Respond ONLY with JSON (no markdown):
+{{
+  "suggested_name": "<snake_case_name>",
+  "reasoning": "<one sentence why>"
+}}
+
+Rules: snake_case, descriptive, no abbreviations unless universal (id, url, etc.)"""
+
+    try:
+        client = _get_client()
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=128,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return json.loads(response.content[0].text.strip())
+    except Exception as e:
+        return {"suggested_name": column, "reasoning": f"LLM unavailable: {e}"}
+
+
+# ─────────────────────────────────────────────────────────────
+# Streamlit UI helpers (call these from your tab files)
+# ─────────────────────────────────────────────────────────────
+
+def render_strategy_card(df: pd.DataFrame, column: str):
+    """Render a Streamlit UI card showing AI-recommended cleaning strategy."""
+    with st.spinner(f"🤖 Analyzing '{column}' with AI..."):
+        result = suggest_cleaning_strategy(df, column)
+
+    confidence_colors = {"high": "🟢", "medium": "🟡", "low": "🔴"}
+    emoji = confidence_colors.get(result.get("confidence", "low"), "⚪")
+
+    st.markdown(f"""
+    <div style="border:1px solid #333; border-radius:8px; padding:16px; margin:8px 0; background:#1a1a2e;">
+        <h4 style="margin:0 0 8px 0;">🧠 AI Recommendation: <code>{result.get('strategy','?')}</code> {emoji}</h4>
+        <p style="margin:4px 0; color:#ccc;">{result.get('reasoning','')}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if result.get("warnings"):
+        for w in result["warnings"]:
+            st.warning(f"⚠️ {w}")
+
+    if result.get("params"):
+        st.caption(f"Suggested parameters: `{result['params']}`")
+
+    return result
+
+
+def render_anomaly_explanation(df: pd.DataFrame, column: str, anomaly_indices: list):
+    """Render AI explanation of detected anomalies inline."""
+    if not anomaly_indices:
+        return
+    with st.spinner("🤖 Generating anomaly explanation..."):
+        explanation = explain_anomalies(df, column, anomaly_indices)
+    st.info(f"🔍 **AI Anomaly Analysis:** {explanation}")
+
+
+def render_quality_report(df: pd.DataFrame, issues: dict):
+    """Render the full AI quality report in an expander."""
+    with st.expander("🤖 AI Data Quality Report", expanded=True):
+        with st.spinner("Generating report with AI..."):
+            report = generate_quality_report(df, issues)
+        st.markdown(report)

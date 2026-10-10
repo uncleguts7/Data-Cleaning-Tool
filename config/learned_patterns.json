@@ -1,0 +1,17 @@
+{
+  "integer_cols": [
+    "Item",
+    "Chat Closed By",
+    "Age",
+    "Price Per Unit"
+  ],
+  "monetary_cols": [
+    "Item",
+    "Age",
+    "Chat Closed By"
+  ],
+  "id_cols": [
+    "Chat Closed By",
+    "Item"
+  ]
+}
